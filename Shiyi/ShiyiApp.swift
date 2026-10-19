@@ -167,7 +167,12 @@ struct WebView: UIViewRepresentable {
         config.userContentController.add(context.coordinator, name: "voice")
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.scrollView.bounces = false
-        webView.load(URLRequest(url: URL(string: "http://172.16.2.89:8899")!))
+        // 界面打包在 App 内（真 APP 版），启动即用，不依赖拉网页
+        if let local = Bundle.main.url(forResource: "index", withExtension: "html") {
+            webView.loadFileURL(local, allowingReadAccessTo: local.deletingLastPathComponent())
+        } else {
+            webView.load(URLRequest(url: URL(string: "http://172.16.2.89:8899")!))
+        }
         controller?.webView = webView
         return webView
     }
