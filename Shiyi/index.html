@@ -590,7 +590,7 @@ window.__shiyiTtsDone = function () {
    ========================================================= */
 (async function boot() {
   setMode("shiyi");
-  if (!NATIVE) {
+  if (!NATIVE && !voiceSupported()) {
     setStatus("网页调试模式 · " + API, "warn");
     return;
   }
