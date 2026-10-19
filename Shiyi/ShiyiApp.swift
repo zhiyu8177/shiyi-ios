@@ -19,6 +19,7 @@ final class VoiceController: NSObject, ObservableObject, AVAudioRecorderDelegate
 
     private var recorder: AVAudioRecorder?
     private var audioURL: URL?
+    private var cancelRequested = false
     private let server = "http://172.16.2.89:8899"
 
     func start() {
@@ -75,6 +76,14 @@ final class VoiceController: NSObject, ObservableObject, AVAudioRecorderDelegate
         if isRecording { stop() }
     }
 
+    // 上滑取消：停止录音且不识别
+    func cancelRecording() {
+        if isRecording {
+            cancelRequested = true
+            stop()
+        }
+    }
+
     // 把状态写进网页顶部的 #status（绿色小字）
     private func jsStatus(_ s: String) {
         guard let webView else { return }
@@ -88,6 +97,11 @@ final class VoiceController: NSObject, ObservableObject, AVAudioRecorderDelegate
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.isRecording = false
+            if self.cancelRequested {
+                self.cancelRequested = false
+                self.jsStatus("已取消")
+                return
+            }
             guard flag, let url = self.audioURL else {
                 self.jsStatus("录音失败，请重试")
                 return
@@ -97,10 +111,11 @@ final class VoiceController: NSObject, ObservableObject, AVAudioRecorderDelegate
     }
 
     private func upload(_ url: URL) {
-        jsStatus("识别中…")
+        jsStatus("识别中…（首次约需1分钟加载模型）")
         var req = URLRequest(url: URL(string: server + "/api/transcribe")!)
         req.httpMethod = "POST"
         req.setValue("audio/wav", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 180  // 首次模型加载可能较慢，防止 60s 默认超时
         URLSession.shared.uploadTask(with: req, fromFile: url) { [weak self] data, _, error in
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -138,6 +153,7 @@ struct WebView: UIViewRepresentable {
             guard message.name == "voice", let cmd = message.body as? String else { return }
             if cmd == "down" { controller?.pressStart() }
             else if cmd == "up" { controller?.releaseStop() }
+            else if cmd == "cancel" { controller?.cancelRecording() }
         }
     }
 
