@@ -2,6 +2,392 @@ import SwiftUI
 import WebKit
 import AVFoundation
 
+// 电脑端服务地址（蒲公英组网 IP 变了就改这里）
+private let SERVER = "http://172.16.2.89:8899"
+
+// ---------------- JSON / JS 字符串工具 ----------------
+private func jsonString(_ obj: [String: Any]) -> String {
+    guard let d = try? JSONSerialization.data(withJSONObject: obj, options: []),
+          let s = String(data: d, encoding: .utf8) else { return "{}" }
+    return s
+}
+
+/// 生成合法的 JS 字符串字面量（自动处理引号、换行、中文）
+private func jsLiteral(_ s: String) -> String {
+    let data = (try? JSONSerialization.data(withJSONObject: [s], options: [])) ?? Data("[\"\"]".utf8)
+    let arr = String(data: data, encoding: .utf8) ?? "[\"\"]"
+    return String(arr.dropFirst().dropLast())
+}
+
+// ---------------- 原生桥：接口请求 + 录音 + 朗读 ----------------
+final class NativeBridge: NSObject, WKScriptMessageHandler,
+                          AVAudioRecorderDelegate, AVAudioPlayerDelegate {
+
+    weak var webView: WKWebView?
+
+    private var recorder: AVAudioRecorder?
+    private var audioURL: URL?
+    private var recordStartedAt: Date?
+    private var cancelRequested = false
+
+    private var player: AVAudioPlayer?
+    private var ttsLoading = false
+
+    // ========== 消息入口：api（接口） / voice（录音） ==========
+    func userContentController(_ controller: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        if message.name == "voice" {
+            guard let cmd = message.body as? String else { return }
+            switch cmd {
+            case "down":   startRecording()
+            case "up":     stopRecording(cancel: false)
+            case "cancel": stopRecording(cancel: true)
+            default: break
+            }
+            return
+        }
+
+        guard message.name == "api",
+              let body = message.body as? [String: Any] else { return }
+        let id = (body["id"] as? NSNumber)?.intValue ?? 0
+        let method = body["method"] as? String ?? ""
+        let params = body["params"] as? [String: Any] ?? [:]
+
+        switch method {
+        case "health":
+            health(id)
+        case "reset":
+            reset(id)
+        case "chat":
+            chat(id, params)
+        case "tts":
+            speak(id, text: params["text"] as? String ?? "")
+        case "ttsStop":
+            stopPlayback()
+            resolve(id, ["playing": false])
+        default:
+            reject(id, "未知方法：\(method)")
+        }
+    }
+
+    // ========== 回调网页 ==========
+    private func eval(_ js: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?.webView?.evaluateJavaScript(js, completionHandler: nil)
+        }
+    }
+
+    private func resolve(_ id: Int, _ data: [String: Any]) {
+        eval("window.__shiyiCb && window.__shiyiCb(\(id), \(jsLiteral(jsonString(["ok": true, "data": data]))));")
+    }
+
+    private func reject(_ id: Int, _ message: String) {
+        eval("window.__shiyiCb && window.__shiyiCb(\(id), \(jsLiteral(jsonString(["ok": false, "error": message]))));")
+    }
+
+    private func status(_ text: String, _ level: String = "") {
+        eval("window.__shiyiStatus && window.__shiyiStatus(\(jsLiteral(text)), \(jsLiteral(level)));")
+    }
+
+    // ========== HTTP ==========
+    private func post(_ path: String, json: [String: Any]?,
+                      completion: @escaping (Data?, Int, String?) -> Void) {
+        guard let url = URL(string: SERVER + path) else {
+            completion(nil, 0, "地址错误"); return
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 240
+        req.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        if let json = json,
+           let body = try? JSONSerialization.data(withJSONObject: json, options: []) {
+            req.httpBody = body
+        }
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            DispatchQueue.main.async { completion(data, code, err?.localizedDescription) }
+        }.resume()
+    }
+
+    // ========== 健康检查 ==========
+    private func health(_ id: Int) {
+        guard let url = URL(string: SERVER + "/health") else { reject(id, "地址错误"); return }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 8
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if let err = err { self.reject(id, "连不上电脑：\(err)"); return }
+                guard let data = data,
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    self.reject(id, "返回值异常"); return
+                }
+                self.resolve(id, ["status": obj["status"] as? String ?? "ok"])
+            }
+        }.resume()
+    }
+
+    // ========== 清空会话 ==========
+    private func reset(_ id: Int) {
+        post("/api/reset", json: [:]) { [weak self] data, code, err in
+            guard let self = self else { return }
+            if let err = err { self.reject(id, "清空失败：\(err)"); return }
+            if code >= 400 { self.reject(id, "清空失败（HTTP \(code)）"); return }
+            self.resolve(id, ["ok": true])
+        }
+    }
+
+    // ========== 对话 ==========
+    private func chat(_ id: Int, _ params: [String: Any]) {
+        let text = (params["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { reject(id, "内容为空"); return }
+        let payload: [String: Any] = [
+            "text": text,
+            "session_id": params["session"] as? String ?? "",
+            "to": params["to"] as? String ?? "shiyi"
+        ]
+        post("/chat", json: payload) { [weak self] data, code, err in
+            guard let self = self else { return }
+            if let err = err {
+                self.reject(id, "请求失败：\(err)")
+                return
+            }
+            guard let data = data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                self.reject(id, "电脑返回异常（HTTP \(code)）")
+                return
+            }
+            if let e = obj["error"] as? String, !e.isEmpty {
+                self.reject(id, e)
+                return
+            }
+            let reply = obj["reply"] as? String ?? ""
+            self.resolve(id, ["reply": reply, "done": true])
+        }
+    }
+
+    // ========== 朗读（原生播放，不经过网页音频） ==========
+    private func speak(_ id: Int, text: String) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { reject(id, "内容为空"); return }
+        if ttsLoading { reject(id, "正在合成中"); return }
+        ttsLoading = true
+        post("/tts", json: ["text": String(t.prefix(500))]) { [weak self] data, code, err in
+            guard let self = self else { return }
+            self.ttsLoading = false
+            if let err = err { self.reject(id, "朗读失败：\(err)"); return }
+            guard let data = data, !data.isEmpty, code < 400 else {
+                self.reject(id, "朗读失败（HTTP \(code)）"); return
+            }
+            do {
+                try AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio,
+                                                               options: [.duckOthers])
+                try AVAudioSession.sharedInstance().setActive(true)
+                self.player?.stop()
+                let p = try AVAudioPlayer(data: data)
+                p.delegate = self
+                p.prepareToPlay()
+                p.play()
+                self.player = p
+                self.resolve(id, ["playing": true])
+            } catch {
+                self.reject(id, "播放失败：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func stopPlayback() {
+        player?.stop()
+        player = nil
+    }
+
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        DispatchQueue.main.async {
+            self.player = nil
+            self.eval("window.__shiyiTtsDone && window.__shiyiTtsDone();")
+        }
+    }
+
+    // ========== 录音（16k 单声道 WAV，FunASR 直接吃） ==========
+    private func startRecording() {
+        if recorder != nil { return }
+        stopPlayback()
+
+        let session = AVAudioSession.sharedInstance()
+        let begin: () -> Void = { [weak self] in
+            guard let self = self else { return }
+            do {
+                try session.setCategory(.playAndRecord, mode: .default,
+                                        options: [.defaultToSpeaker, .allowBluetooth])
+                try session.setActive(true, options: [])
+            } catch {
+                self.status("录音设备被占用", "err")
+                self.rejectRecording("音频初始化失败")
+                return
+            }
+
+            let settings: [String: Any] = [
+                AVFormatIDKey: Int(kAudioFormatLinearPCM),
+                AVSampleRateKey: 16000.0,
+                AVNumberOfChannelsKey: 1,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false
+            ]
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("shiyi_voice.wav")
+            try? FileManager.default.removeItem(at: url)
+            do {
+                let rec = try AVAudioRecorder(url: url, settings: settings)
+                rec.delegate = self
+                rec.isMeteringEnabled = true
+                rec.record()
+                self.recorder = rec
+                self.audioURL = url
+                self.recordStartedAt = Date()
+                self.cancelRequested = false
+                self.status("正在听…", "warn")
+            } catch {
+                self.status("录音启动失败", "err")
+                self.rejectRecording("录音启动失败")
+            }
+        }
+
+        if #available(iOS 17.0, *) {
+            AVAudioApplication.requestRecordPermission { granted in
+                DispatchQueue.main.async {
+                    if granted { begin() } else { self.denied() }
+                }
+            }
+        } else {
+            session.requestRecordPermission { granted in
+                DispatchQueue.main.async {
+                    if granted { begin() } else { self.denied() }
+                }
+            }
+        }
+    }
+
+    private func denied() {
+        status("麦克风权限被拒绝", "err")
+        eval("window.__shiyiAsr && window.__shiyiAsr('', false, '请到 设置→拾壹 里打开麦克风');")
+    }
+
+    private func rejectRecording(_ message: String) {
+        eval("window.__shiyiAsr && window.__shiyiAsr('', false, \(jsLiteral(message)));")
+    }
+
+    private func stopRecording(cancel: Bool) {
+        guard let rec = recorder else { return }
+        cancelRequested = cancel
+        rec.stop()
+        recorder = nil
+    }
+
+    func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
+        defer { recordStartedAt = nil }
+        let url = audioURL
+        let elapsed = recordStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+
+        if cancelRequested {
+            cancelRequested = false
+            status("已取消", "")
+            return
+        }
+        guard flag, let url = url else {
+            status("录音失败", "err")
+            rejectRecording("录音失败，请重试")
+            return
+        }
+        if elapsed < 0.5 {
+            status("说话时间太短", "warn")
+            rejectRecording("说话时间太短")
+            return
+        }
+        upload(url)
+    }
+
+    private func upload(_ url: URL) {
+        status("识别中…", "warn")
+        guard let endpoint = URL(string: SERVER + "/asr") else {
+            rejectRecording("地址错误"); return
+        }
+        var req = URLRequest(url: endpoint)
+        req.httpMethod = "POST"
+        req.setValue("audio/wav", forHTTPHeaderField: "Content-Type")
+        req.timeoutInterval = 180
+
+        URLSession.shared.uploadTask(with: req, fromFile: url) { [weak self] data, resp, err in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if let err = err {
+                    self.status("识别失败", "err")
+                    self.rejectRecording("连不上电脑：\(err.localizedDescription)")
+                    return
+                }
+                guard let data = data,
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    self.status("识别失败", "err")
+                    self.rejectRecording("电脑返回异常")
+                    return
+                }
+                if let e = obj["error"] as? String, !e.isEmpty {
+                    self.status("识别失败", "err")
+                    self.rejectRecording(e)
+                    return
+                }
+                let text = (obj["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if text.isEmpty {
+                    self.status("没听清", "warn")
+                    self.rejectRecording("没听清，再说一次")
+                    return
+                }
+                self.status("已识别", "ok")
+                self.eval("window.__shiyiAsr && window.__shiyiAsr(\(jsLiteral(text)), true, '');")
+            }
+        }.resume()
+    }
+}
+
+// ---------------- WebView 壳 ----------------
+struct WebView: UIViewRepresentable {
+    let bridge: NativeBridge
+
+    func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []
+        config.userContentController.add(bridge, name: "api")
+        config.userContentController.add(bridge, name: "voice")
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.isOpaque = false
+        webView.backgroundColor = UIColor(red: 0.96, green: 0.955, blue: 0.945, alpha: 1)
+        webView.scrollView.bounces = false
+        webView.scrollView.contentInsetAdjustmentBehavior = .never
+        webView.allowsLinkPreview = false
+
+        bridge.webView = webView
+
+        // 界面打包在 App 内（真 APP 版），启动即用，不联网拉页面
+        if let local = Bundle.main.url(forResource: "index", withExtension: "html") {
+            webView.loadFileURL(local, allowingReadAccessTo: local.deletingLastPathComponent())
+        } else {
+            webView.load(URLRequest(url: URL(string: SERVER)!))
+        }
+
+        // 长按不弹菜单，操作更像原生 App
+        let css = "addEventListener('DOMContentLoaded',function(){var s=document.createElement('style');" +
+                  "s.textContent='*{-webkit-touch-callout:none;}';document.head.appendChild(s);});"
+        webView.evaluateJavaScript(css, completionHandler: nil)
+        return webView
+    }
+
+    func updateUIView(_ uiView: WKWebView, context: Context) {}
+}
+
+// ---------------- 入口 ----------------
 @main
 struct ShiyiApp: App {
     var body: some Scene {
@@ -11,181 +397,16 @@ struct ShiyiApp: App {
     }
 }
 
-// ---------------- 语音控制器：原生录音 → 本地识别 → 回填页面 ----------------
-final class VoiceController: NSObject, ObservableObject, AVAudioRecorderDelegate {
-    @Published var isRecording = false
-    @Published var status = ""
-    weak var webView: WKWebView?
-
-    private var recorder: AVAudioRecorder?
-    private var audioURL: URL?
-    private var cancelRequested = false
-    private let server = "http://172.16.2.89:8899"
-
-    func start() {
-        let session = AVAudioSession.sharedInstance()
-        session.requestRecordPermission { [weak self] granted in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                if !granted {
-                    self.jsStatus("麦克风权限被拒绝，请在设置中开启")
-                    return
-                }
-                self.beginRecording()
-            }
-        }
-    }
-
-    private func beginRecording() {
-        do {
-            try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
-            try AVAudioSession.sharedInstance().setActive(true)
-        } catch {
-            jsStatus("音频会话启动失败")
-            return
-        }
-
-        // 16kHz 单声道 Int16，直接产出标准 WAV，后端 FunASR 可直接识别
-        let fmt = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true)!
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("shiyi_voice.wav")
-        do {
-            let rec = try AVAudioRecorder(url: url, format: fmt)
-            rec.delegate = self
-            rec.record()
-            recorder = rec
-            audioURL = url
-            isRecording = true
-            jsStatus("按住说话中，松开结束…")
-        } catch {
-            jsStatus("录音启动失败")
-        }
-    }
-
-    private func stop() {
-        recorder?.stop()
-        recorder = nil
-    }
-
-    // 按住说话：按下开始，松手结束（网页按钮桥接调用）
-    func pressStart() {
-        if isRecording { return }
-        start()
-    }
-
-    func releaseStop() {
-        if isRecording { stop() }
-    }
-
-    // 上滑取消：停止录音且不识别
-    func cancelRecording() {
-        if isRecording {
-            cancelRequested = true
-            stop()
-        }
-    }
-
-    // 把状态写进网页顶部的 #status（绿色小字）
-    private func jsStatus(_ s: String) {
-        guard let webView else { return }
-        let arr = String(data: (try? JSONSerialization.data(withJSONObject: [s])) ?? Data("[\"\"]".utf8), encoding: .utf8) ?? "[\"\"]"
-        let jsStr = String(arr.dropFirst().dropLast())
-        webView.evaluateJavaScript("var el=document.getElementById('status'); if(el){el.textContent=\(jsStr);}", completionHandler: nil)
-    }
-
-    // AVAudioRecorderDelegate：停止后回调
-    func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.isRecording = false
-            if self.cancelRequested {
-                self.cancelRequested = false
-                self.jsStatus("已取消")
-                return
-            }
-            guard flag, let url = self.audioURL else {
-                self.jsStatus("录音失败，请重试")
-                return
-            }
-            self.upload(url)
-        }
-    }
-
-    private func upload(_ url: URL) {
-        jsStatus("识别中…（首次约需1分钟加载模型）")
-        var req = URLRequest(url: URL(string: server + "/api/transcribe")!)
-        req.httpMethod = "POST"
-        req.setValue("audio/wav", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 180  // 首次模型加载可能较慢，防止 60s 默认超时
-        URLSession.shared.uploadTask(with: req, fromFile: url) { [weak self] data, _, error in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                guard let data, error == nil,
-                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let text = obj["text"] as? String, !text.isEmpty else {
-                    self.jsStatus("识别失败，请重试")
-                    return
-                }
-                self.jsStatus("")
-                self.fillInput(text)
-            }
-        }.resume()
-    }
-
-    private func fillInput(_ text: String) {
-        guard let webView else { return }
-        // JSON 序列化生成合法 JS 字符串字面量，避免引号/换行破坏语法
-        let arr = String(data: (try? JSONSerialization.data(withJSONObject: [text])) ?? Data("[\"\"]".utf8), encoding: .utf8) ?? "[\"\"]"
-        let jsStr = String(arr.dropFirst().dropLast())
-        let js = "var el=document.getElementById('input'); if(el){el.value=\(jsStr); el.focus();}"
-        webView.evaluateJavaScript(js, completionHandler: nil)
-    }
-}
-
-// ---------------- WebView 壳 ----------------
-struct WebView: UIViewRepresentable {
-    weak var controller: VoiceController?
-
-    // 接收网页按钮桥接：down=按下开始录音，up=松开结束并识别
-    final class Coordinator: NSObject, WKScriptMessageHandler {
-        weak var controller: VoiceController?
-        init(_ controller: VoiceController?) { self.controller = controller }
-        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-            guard message.name == "voice", let cmd = message.body as? String else { return }
-            if cmd == "down" { controller?.pressStart() }
-            else if cmd == "up" { controller?.releaseStop() }
-            else if cmd == "cancel" { controller?.cancelRecording() }
-        }
-    }
-
-    func makeCoordinator() -> Coordinator { Coordinator(controller) }
-
-    func makeUIView(context: Context) -> WKWebView {
-        let config = WKWebViewConfiguration()
-        config.allowsInlineMediaPlayback = true
-        config.mediaTypesRequiringUserActionForPlayback = []  // 允许 /tts 自动朗读回复
-        // 网页输入框旁的麦克风按钮 → 原生录音（按住说话）
-        config.userContentController.add(context.coordinator, name: "voice")
-        let webView = WKWebView(frame: .zero, configuration: config)
-        webView.scrollView.bounces = false
-        // 界面打包在 App 内（真 APP 版），启动即用，不依赖拉网页
-        if let local = Bundle.main.url(forResource: "index", withExtension: "html") {
-            webView.loadFileURL(local, allowingReadAccessTo: local.deletingLastPathComponent())
-        } else {
-            webView.load(URLRequest(url: URL(string: "http://172.16.2.89:8899")!))
-        }
-        controller?.webView = webView
-        return webView
-    }
-
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
-}
-
-// ---------------- 主界面：全屏 WebView（按钮和状态都在网页里） ----------------
 struct ContentView: View {
-    @StateObject private var voice = VoiceController()
+    @StateObject private var holder = BridgeHolder()
 
     var body: some View {
-        WebView(controller: voice)
+        WebView(bridge: holder.bridge)
             .ignoresSafeArea()
+            .preferredColorScheme(.light)
     }
+}
+
+final class BridgeHolder: ObservableObject {
+    let bridge = NativeBridge()
 }
