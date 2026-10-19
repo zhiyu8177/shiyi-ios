@@ -9,7 +9,17 @@ targets:
     platform: iOS
     sources:
       - path: Shiyi
+    info:
+      path: Shiyi/Info.plist
+      properties:
+        CFBundleDisplayName: 鎷惧９
+        CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
+        CFBundleVersion: "1"
+        CFBundleShortVersionString: "1.0"
+        UILaunchScreen: {}
+        UIApplicationSceneManifest: {}
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.shiyi.app
         PRODUCT_NAME: Shiyi
+        INFOPLIST_FILE: Shiyi/Info.plist
