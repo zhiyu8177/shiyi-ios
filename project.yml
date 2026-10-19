@@ -18,6 +18,8 @@ targets:
         CFBundleShortVersionString: "1.0"
         UILaunchScreen: {}
         UIApplicationSceneManifest: {}
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.shiyi.app
