@@ -9,8 +9,8 @@ targets:
     platform: iOS
     sources:
       - path: Shiyi
-    info:
-      path: Shiyi/Info.plist
+        excludes:
+          - "Info.plist"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.shiyi.app
