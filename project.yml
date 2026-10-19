@@ -1,0 +1,18 @@
+name: Shiyi
+options:
+  bundleIdPrefix: com.shiyi
+  deploymentTarget:
+    iOS: "14.0"
+targets:
+  Shiyi:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.shiyi.app
+        PRODUCT_NAME: 鎷惧９
+        INFOPLIST_KEY_NSHumanUsageDescription: "闇€瑕佺綉缁滆繛鎺ヨ闂嬀澹规湇鍔?
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
