@@ -11,17 +11,12 @@ targets:
       - path: Shiyi
     info:
       path: Shiyi/Info.plist
-      properties:
-        CFBundleDisplayName: 鎷惧９
-        CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
-        CFBundleVersion: "1"
-        CFBundleShortVersionString: "1.0"
-        UILaunchScreen: {}
-        UIApplicationSceneManifest: {}
-        NSAppTransportSecurity:
-          NSAllowsArbitraryLoads: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.shiyi.app
         PRODUCT_NAME: Shiyi
         INFOPLIST_FILE: Shiyi/Info.plist
+        SWIFT_VERSION: "5.9"
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
