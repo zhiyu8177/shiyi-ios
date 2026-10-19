@@ -5,20 +5,20 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_15.app
+      - name: Setup Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
 
       - name: Install XcodeGen
         run: brew install xcodegen
 
-      - name: Generate project
+      - name: Generate Xcode project
         run: xcodegen generate
 
-      - name: Build
+      - name: Build for device
         run: |
           xcodebuild build \
             -project Shiyi.xcodeproj \
@@ -26,19 +26,18 @@ jobs:
             -configuration Release \
             -sdk iphoneos \
             -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
 
-      - name: Package IPA
+      - name: Create IPA
         run: |
           cd build/Build/Products/Release-iphoneos
-          mkdir Payload
+          mkdir -p Payload
           cp -r Shiyi.app Payload/
           zip -r ../../../Shiyi.ipa Payload
-          cd ../../..
-          ls -la Shiyi.ipa
 
-      - name: Upload
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
           name: Shiyi-ipa
