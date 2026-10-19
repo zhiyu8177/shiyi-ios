@@ -1,4 +1,5 @@
 import SwiftUI
+import WebKit
 
 @main
 struct ShiyiApp: App {
