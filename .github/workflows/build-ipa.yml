@@ -9,22 +9,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Generate Xcode project
-        run: |
-          brew install xcodegen
-          xcodegen generate
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.app
 
-      - name: Build IPA
-        run: |
-          xcodebuild -project Shiyi.xcodeproj -scheme Shiyi -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO
-          mkdir -p build/Payload
-          cp -r build/Build/Products/Release-iphoneos/Shiyi.app build/Payload/
-          cd build
-          zip -r Shiyi-ipa.zip Payload
-          mv Shiyi-ipa.zip ../
+      - name: Install XcodeGen
+        run: brew install xcodegen
 
-      - name: Upload artifact
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Build
+        run: |
+          xcodebuild build \
+            -project Shiyi.xcodeproj \
+            -scheme Shiyi \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Package IPA
+        run: |
+          cd build/Build/Products/Release-iphoneos
+          mkdir Payload
+          cp -r Shiyi.app Payload/
+          zip -r ../../../Shiyi.ipa Payload
+          cd ../../..
+          ls -la Shiyi.ipa
+
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: Shiyi-ipa
-          path: Shiyi-ipa.zip
+          path: Shiyi.ipa
