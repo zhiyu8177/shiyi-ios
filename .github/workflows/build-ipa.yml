@@ -17,23 +17,41 @@ jobs:
       - name: Show toolchain
         run: xcodebuild -version && sw_vers
 
-      - name: Install XcodeGen
+      - name: Install XcodeGen (pinned, Xcode 15 compatible)
         run: |
-          curl -fsSL -o /tmp/xcodegen.zip https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen.zip
+          set -e
+          curl -fsSL -o /tmp/xcodegen.zip https://github.com/yonaskolb/XcodeGen/releases/download/2.42.0/xcodegen.zip
           unzip -q /tmp/xcodegen.zip -d /tmp
           sudo mv /tmp/xcodegen/bin/xcodegen /usr/local/bin/xcodegen
           xcodegen --version
 
       - name: Generate Xcode project
-        run: xcodegen generate
+        run: |
+          xcodegen generate
+          echo "--- objectVersion ---"
+          grep -m1 objectVersion Shiyi.xcodeproj/project.pbxproj || true
+          # 兜底：若仍是 Xcode16 格式(77)，降到 Xcode15 可读的 56
+          sed -i '' 's/objectVersion = 77;/objectVersion = 56;/' Shiyi.xcodeproj/project.pbxproj || true
+          grep -m1 objectVersion Shiyi.xcodeproj/project.pbxproj || true
 
       - name: Build for device
         run: |
           set -o pipefail
-          xcodebuild build             -project Shiyi.xcodeproj             -scheme Shiyi             -configuration Release             -sdk iphoneos             -derivedDataPath build             CODE_SIGN_IDENTITY=""             CODE_SIGNING_REQUIRED=NO             CODE_SIGNING_ALLOWED=NO
+          xcodebuild build \
+            -project Shiyi.xcodeproj \
+            -scheme Shiyi \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            | tee xcodebuild.log
+          tail -40 xcodebuild.log
 
       - name: Create IPA
         run: |
+          set -e
           cd build/Build/Products/Release-iphoneos
           ls -l
           mkdir -p Payload
