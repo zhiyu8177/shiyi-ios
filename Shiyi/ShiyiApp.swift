@@ -1,27 +1,186 @@
 import SwiftUI
 import WebKit
+import AVFoundation
 
 @main
 struct ShiyiApp: App {
     var body: some Scene {
         WindowGroup {
-            WebView(url: URL(string: "http://172.16.2.89:8899")!)
-                .edgesIgnoringSafeArea(.all)
+            ContentView()
         }
     }
 }
 
+// ---------------- 语音控制器：原生录音 → 本地识别 → 回填页面 ----------------
+final class VoiceController: NSObject, ObservableObject, AVAudioRecorderDelegate {
+    @Published var isRecording = false
+    @Published var status = ""
+    weak var webView: WKWebView?
+
+    private var recorder: AVAudioRecorder?
+    private var audioURL: URL?
+    private let server = "http://172.16.2.89:8899"
+
+    func start() {
+        let session = AVAudioSession.sharedInstance()
+        session.requestRecordPermission { [weak self] granted in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if !granted {
+                    self.status = "麦克风权限被拒绝，请在设置中开启"
+                    return
+                }
+                self.beginRecording()
+            }
+        }
+    }
+
+    private func beginRecording() {
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            status = "音频会话启动失败"
+            return
+        }
+
+        // 16kHz 单声道 Int16，直接产出标准 WAV，后端 FunASR 可直接识别
+        let fmt = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true)!
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("shiyi_voice.wav")
+        do {
+            let rec = try AVAudioRecorder(url: url, format: fmt)
+            rec.delegate = self
+            rec.record()
+            recorder = rec
+            audioURL = url
+            isRecording = true
+            status = "按住说话中，松开结束"
+        } catch {
+            status = "录音启动失败"
+        }
+    }
+
+    private func stop() {
+        recorder?.stop()
+        recorder = nil
+    }
+
+    // 按住说话：按下开始，松手结束
+    func pressStart() {
+        if isRecording { return }
+        start()
+    }
+
+    func releaseStop() {
+        if isRecording { stop() }
+    }
+
+    // AVAudioRecorderDelegate：停止后回调
+    func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isRecording = false
+            guard flag, let url = self.audioURL else {
+                self.status = "录音失败，请重试"
+                return
+            }
+            self.upload(url)
+        }
+    }
+
+    private func upload(_ url: URL) {
+        status = "识别中…"
+        var req = URLRequest(url: URL(string: server + "/api/transcribe")!)
+        req.httpMethod = "POST"
+        req.setValue("audio/wav", forHTTPHeaderField: "Content-Type")
+        URLSession.shared.uploadTask(with: req, fromFile: url) { [weak self] data, _, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard let data, error == nil,
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let text = obj["text"] as? String, !text.isEmpty else {
+                    self.status = "识别失败，请重试"
+                    return
+                }
+                self.status = ""
+                self.fillInput(text)
+            }
+        }.resume()
+    }
+
+    private func fillInput(_ text: String) {
+        guard let webView else { return }
+        // JSON 序列化生成合法 JS 字符串字面量，避免引号/换行破坏语法
+        let arr = String(data: (try? JSONSerialization.data(withJSONObject: [text])) ?? Data("[\"\"]".utf8), encoding: .utf8) ?? "[\"\"]"
+        let jsStr = String(arr.dropFirst().dropLast())
+        let js = "var el=document.getElementById('input'); if(el){el.value=\(jsStr); el.focus();}"
+        webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+}
+
+// ---------------- WebView 壳 ----------------
 struct WebView: UIViewRepresentable {
-    let url: URL
+    weak var controller: VoiceController?
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
+        // 隐藏网页自带麦克风按钮：局域网 HTTP 下网页 getUserMedia 会被 iOS 拒绝，
+        // 手机端统一用原生录音按钮
+        let hideMic = WKUserScript(
+            source: "var b=document.getElementById('btnMic'); if(b){b.style.display='none';}",
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true
+        )
+        config.userContentController.addUserScript(hideMic)
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.scrollView.bounces = false
-        webView.load(URLRequest(url: url))
+        webView.load(URLRequest(url: URL(string: "http://172.16.2.89:8899")!))
+        controller?.webView = webView
         return webView
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {}
+}
+
+// ---------------- 主界面：WebView + 右上角录音按钮 ----------------
+struct ContentView: View {
+    @StateObject private var voice = VoiceController()
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            WebView(controller: voice)
+                .ignoresSafeArea()
+
+            VStack(alignment: .trailing, spacing: 10) {
+                // 按住说话：按下开始录音，松手自动识别
+                ZStack {
+                    Image(systemName: voice.isRecording ? "mic.circle.fill" : "mic.circle")
+                        .font(.system(size: 46))
+                        .foregroundColor(voice.isRecording ? .red : .green)
+                        .background(Circle().fill(Color.white.opacity(0.92)))
+                        .shadow(color: .black.opacity(0.25), radius: 5, y: 2)
+                        .scaleEffect(voice.isRecording ? 1.25 : 1.0)
+                        .animation(.easeInOut(duration: 0.15), value: voice.isRecording)
+                }
+                .contentShape(Circle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { _ in voice.pressStart() }
+                        .onEnded { _ in voice.releaseStop() }
+                )
+                if !voice.status.isEmpty {
+                    Text(voice.status)
+                        .font(.system(size: 13))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Color.black.opacity(0.75))
+                        .foregroundColor(.white)
+                        .cornerRadius(16)
+                }
+            }
+            .padding(.top, 58)
+            .padding(.trailing, 16)
+        }
+    }
 }
