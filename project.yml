@@ -8,10 +8,8 @@ targets:
     type: application
     platform: iOS
     sources:
-      - path: Shiyi/Sources
+      - path: Shiyi
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.shiyi.app
-        PRODUCT_NAME: 鎷惧９
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        PRODUCT_NAME: Shiyi
