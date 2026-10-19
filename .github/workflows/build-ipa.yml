@@ -32,7 +32,7 @@ jobs:
           cd build/Build/Products/Release-iphoneos
           mkdir -p Payload
           cp -r Shiyi.app Payload/
-          zip -r ../../../Shiyi.ipa Payload
+          zip -r ../../../../Shiyi.ipa Payload
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
