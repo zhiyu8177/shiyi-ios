@@ -162,6 +162,7 @@ struct WebView: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []  // 允许 /tts 自动朗读回复
         // 网页输入框旁的麦克风按钮 → 原生录音（按住说话）
         config.userContentController.add(context.coordinator, name: "voice")
         let webView = WKWebView(frame: .zero, configuration: config)
