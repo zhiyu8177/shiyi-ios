@@ -2,8 +2,43 @@ import SwiftUI
 import WebKit
 import AVFoundation
 
-// 电脑端服务地址（蒲公英组网 IP 变了就改这里）
-private let SERVER = "http://172.16.2.89:8899"
+// 电脑端服务地址候选（蒲公英组网 IP 变了不用重编壳：启动后自动探测，谁通用谁）
+private let SERVER_CANDIDATES = [
+    "http://172.16.2.89:8899",   // 联想机旧地址（保留兼容）
+    "http://172.16.2.248:8899",  // 本机（至强）蒲公英地址
+    "http://192.168.1.3:8899",   // 手机与电脑同一 WiFi 时直连
+]
+private var SERVER = SERVER_CANDIDATES[0]
+
+/// 探测某个地址的 /health，回调保证在主线程
+private func probeHealth(_ base: String, timeout: TimeInterval = 3,
+                         completion: @escaping (Bool) -> Void) {
+    guard let url = URL(string: base + "/health") else {
+        DispatchQueue.main.async { completion(false) }
+        return
+    }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = timeout
+    req.cachePolicy = .reloadIgnoringLocalCacheData
+    URLSession.shared.dataTask(with: req) { data, resp, _ in
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        DispatchQueue.main.async { completion(code == 200 && data != nil) }
+    }.resume()
+}
+
+/// 按顺序探测候选地址，命中即更新全局 SERVER
+private func resolveServer(index: Int = 0, completion: (() -> Void)? = nil) {
+    if index >= SERVER_CANDIDATES.count { completion?(); return }
+    let base = SERVER_CANDIDATES[index]
+    probeHealth(base) { ok in
+        if ok {
+            SERVER = base
+            completion?()
+        } else {
+            resolveServer(index: index + 1, completion: completion)
+        }
+    }
+}
 
 // ---------------- JSON / JS 字符串工具 ----------------
 private func jsonString(_ obj: [String: Any]) -> String {
@@ -104,6 +139,7 @@ final class NativeBridge: NSObject, WKScriptMessageHandler,
             req.httpBody = body
         }
         URLSession.shared.dataTask(with: req) { data, resp, err in
+            if err != nil { resolveServer() }   // 连不上就顺手换下一个可用地址
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             DispatchQueue.main.async { completion(data, code, err?.localizedDescription) }
         }.resume()
@@ -111,6 +147,15 @@ final class NativeBridge: NSObject, WKScriptMessageHandler,
 
     // ========== 健康检查 ==========
     private func health(_ id: Int) {
+        // 当前地址不通就自动换候选，不用每次手点「检」
+        probeHealth(SERVER) { [weak self] ok in
+            guard let self = self else { return }
+            if ok { self.healthRequest(id); return }
+            resolveServer { self.healthRequest(id) }
+        }
+    }
+
+    private func healthRequest(_ id: Int) {
         guard let url = URL(string: SERVER + "/health") else { reject(id, "地址错误"); return }
         var req = URLRequest(url: url)
         req.timeoutInterval = 8
