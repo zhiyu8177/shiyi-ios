@@ -511,7 +511,9 @@ async function pollAlerts() {
       if (items.length) {
         const newest = items[items.length - 1];
         const ageMin = (Date.now() - Number(newest.id)) / 60000;
-        if (ageMin >= 0 && ageMin < 30) showAlert(newest);
+        // 半小时内的正常提醒；"就绪回执"（tag=sys）不管隔多久都亮一次，
+        // 否则装完 App 没反应，分不清是没报警还是没通
+        if ((ageMin >= 0 && ageMin < 30) || newest.tag === "sys") showAlert(newest);
       }
       alertLast = last;
       localStorage.setItem("shiyi_alert_last", alertLast);
