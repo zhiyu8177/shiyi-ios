@@ -1,6 +1,7 @@
 import SwiftUI
 import WebKit
 import AVFoundation
+import UIKit
 
 // 电脑端服务地址候选（蒲公英组网 IP 变了不用重编壳：启动后自动探测，谁通用谁）
 private let SERVER_CANDIDATES = [
@@ -100,6 +101,12 @@ final class NativeBridge: NSObject, WKScriptMessageHandler,
         case "ttsStop":
             stopPlayback()
             resolve(id, ["playing": false])
+        case "alerts":
+            // 取盯盘提醒：界面上每 10 秒拉一次，有新的就弹窗 + 震一下
+            alerts(id, since: (params["since"] as? NSNumber)?.intValue ?? 0)
+        case "buzz":
+            // iOS 的 WKWebView 不支持 navigator.vibrate，震动只能走原生
+            buzz(id, style: params["style"] as? String ?? "medium")
         default:
             reject(id, "未知方法：\(method)")
         }
@@ -171,6 +178,48 @@ final class NativeBridge: NSObject, WKScriptMessageHandler,
                 self.resolve(id, ["status": obj["status"] as? String ?? "ok"])
             }
         }.resume()
+    }
+
+    // ========== 盯盘提醒 ==========
+    /// 拉取 /alerts。连不上就顺手换一次地址再试，不要因为换网就再也收不到。
+    private func alerts(_ id: Int, since: Int) {
+        func request() {
+            guard let url = URL(string: SERVER + "/alerts?since=\(since)") else {
+                reject(id, "地址错误"); return
+            }
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 6
+            req.cachePolicy = .reloadIgnoringLocalCacheData
+            URLSession.shared.dataTask(with: req) { [weak self] data, _, err in
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    guard err == nil, let data = data,
+                          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                    else { self.reject(id, "连不上电脑"); return }
+                    self.resolve(id, ["payload": obj])
+                }
+            }.resume()
+        }
+
+        probeHealth(SERVER, timeout: 1.5) { ok in
+            if ok { request(); return }
+            resolveServer { request() }
+        }
+    }
+
+    /// 震动。style: light / medium / heavy
+    private func buzz(_ id: Int, style: String) {
+        let g = UIImpactFeedbackGenerator(
+            style: style == "heavy" ? .heavy : (style == "light" ? .light : .medium))
+        g.prepare()
+        g.impactOccurred()
+        if style == "heavy" {
+            // 紧急提醒多震两下，口袋里有感觉
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) {
+                UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+            }
+        }
+        resolve(id, ["ok": true])
     }
 
     // ========== 清空会话 ==========
