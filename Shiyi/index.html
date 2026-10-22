@@ -307,8 +307,20 @@ async function httpCall(method, p) {
   }
   if (method === "ttsStop") { stopAudio(); return {}; }
   if (method === "alerts") {
-    const r = await apiFetch("/alerts?since=" + (p.since || 0), { cache: "no-store" });
-    return { payload: await r.json() };
+    const since = p.since || 0;
+    const r = await apiFetch("/alerts?since=" + since, { cache: "no-store" });
+    if (r.ok) return { payload: await r.json() };
+    // 电脑端还是旧代码（404）→ 改读静态清单。
+    // 8899 每次请求都重新读这个文件，所以不用重启服务也能拿到提醒。
+    const r2 = await apiFetch("/manifest.json", { cache: "no-store" });
+    const m = await r2.json();
+    const al = m.alerts || [];
+    return {
+      payload: {
+        items: al.filter(function (x) { return Number(x.id) > since; }),
+        last: al.length ? Number(al[al.length - 1].id) : 0
+      }
+    };
   }
   if (method === "buzz") return {};   // 浏览器里没有震动，静默跳过
   throw new Error("未知方法 " + method);
@@ -491,10 +503,16 @@ async function pollAlerts() {
   // 服务端被清过（last 比本地指针小）→ 指针归零重来
   if (last && last < alertLast) alertLast = 0;
 
-  // 第一次跑且从没接过：对着历史位置定个起点，别把旧提醒全弹出来
+  // 第一次跑且从没接过：不补弹历史（最多 30 条会刷屏），
+  // 但把半小时内最新那条亮出来 —— 相当于"通道已就绪"的回执
   if (!alertBooted) {
     alertBooted = true;
     if (!alertLast) {
+      if (items.length) {
+        const newest = items[items.length - 1];
+        const ageMin = (Date.now() - Number(newest.id)) / 60000;
+        if (ageMin >= 0 && ageMin < 30) showAlert(newest);
+      }
       alertLast = last;
       localStorage.setItem("shiyi_alert_last", alertLast);
       return;
