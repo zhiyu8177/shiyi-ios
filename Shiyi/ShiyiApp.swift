@@ -181,29 +181,49 @@ final class NativeBridge: NSObject, WKScriptMessageHandler,
     }
 
     // ========== 盯盘提醒 ==========
-    /// 拉取 /alerts。连不上就顺手换一次地址再试，不要因为换网就再也收不到。
-    private func alerts(_ id: Int, since: Int) {
-        func request() {
-            guard let url = URL(string: SERVER + "/alerts?since=\(since)") else {
-                reject(id, "地址错误"); return
+    /// GET 一个 JSON，回调 (对象, 状态码)。连不上给 (nil, 0)。
+    private func fetchJSON(_ path: String, _ cb: @escaping ([String: Any]?, Int) -> Void) {
+        guard let url = URL(string: SERVER + path) else { cb(nil, 0); return }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 6
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            var obj: [String: Any]?
+            if err == nil, let d = data {
+                obj = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any]
             }
-            var req = URLRequest(url: url)
-            req.timeoutInterval = 6
-            req.cachePolicy = .reloadIgnoringLocalCacheData
-            URLSession.shared.dataTask(with: req) { [weak self] data, _, err in
-                DispatchQueue.main.async {
-                    guard let self = self else { return }
-                    guard err == nil, let data = data,
-                          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                    else { self.reject(id, "连不上电脑"); return }
-                    self.resolve(id, ["payload": obj])
-                }
-            }.resume()
+            DispatchQueue.main.async { cb(obj, code) }
+        }.resume()
+    }
+
+    /// 拉取盯盘提醒。
+    /// 正路是 /alerts；如果电脑端还是旧代码（404），就退回去读静态清单
+    /// /manifest.json —— 那个文件每次请求都重新读盘，所以不重启服务也能送达。
+    private func alerts(_ id: Int, since: Int) {
+        func viaManifest() {
+            fetchJSON("/manifest.json") {
+                [weak self] obj, code in
+                guard let self = self else { return }
+                guard code == 200, let m = obj else { self.reject(id, "连不上电脑"); return }
+                let al = (m["alerts"] as? [[String: Any]]) ?? []
+                let items = al.filter { (($0["id"] as? NSNumber)?.intValue ?? 0) > since }
+                let last = ((al.last?["id"]) as? NSNumber)?.intValue ?? 0
+                self.resolve(id, ["payload": ["items": items, "last": last]])
+            }
+        }
+
+        func live() {
+            fetchJSON("/alerts?since=\(since)") { [weak self] obj, code in
+                guard let self = self else { return }
+                if code == 200, let o = obj { self.resolve(id, ["payload": o]); return }
+                viaManifest()
+            }
         }
 
         probeHealth(SERVER, timeout: 1.5) { ok in
-            if ok { request(); return }
-            resolveServer { request() }
+            if ok { live(); return }
+            resolveServer { live() }
         }
     }
 
