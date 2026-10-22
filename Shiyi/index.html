@@ -75,6 +75,23 @@
   }
   .user .bubble { background: var(--blue); color: #fff; border-bottom-right-radius: 5px; }
   .bot .bubble { background: var(--card); border: 1px solid var(--line); border-bottom-left-radius: 5px; }
+
+  /* 盯盘提醒：和聊天消息区分开，一眼能认出是系统推的 */
+  .msg.alert { align-items: stretch; }
+  .alert .bubble {
+    background: var(--amber-soft); border: 1px solid #E8C89A;
+    border-left: 3px solid var(--amber); border-radius: 10px;
+    padding: 10px 12px; min-width: 0;
+  }
+  .alert.hot .bubble {
+    background: var(--red-soft); border-color: var(--red-line);
+    border-left-color: var(--red);
+  }
+  .alert .head { display: flex; gap: 8px; align-items: baseline; margin-bottom: 5px; }
+  .alert .ttl { font-weight: 600; font-size: 14px; flex: 1; min-width: 0; }
+  .alert.hot .ttl { color: var(--red); }
+  .alert .tm { color: var(--hint); font-size: 11px; flex: none; }
+  .alert .bd { white-space: pre-wrap; font-size: 13px; line-height: 1.55; }
   .err .bubble { background: var(--red-soft); border: 1px solid var(--red-line); color: var(--red); }
   .meta { font-size: 11px; color: var(--hint); padding: 0 4px; display: flex; gap: 8px; align-items: center; }
   .speak {
@@ -289,6 +306,11 @@ async function httpCall(method, p) {
     return { playing: true };
   }
   if (method === "ttsStop") { stopAudio(); return {}; }
+  if (method === "alerts") {
+    const r = await apiFetch("/alerts?since=" + (p.since || 0), { cache: "no-store" });
+    return { payload: await r.json() };
+  }
+  if (method === "buzz") return {};   // 浏览器里没有震动，静默跳过
   throw new Error("未知方法 " + method);
 }
 
@@ -392,6 +414,107 @@ async function toggleSpeak(btn, text) {
     speakingBtn = null;
     toast("朗读失败：" + e.message);
   }
+}
+
+/* =========================================================
+   盯盘提醒
+   盯盘脚本把提醒塞进电脑端的 /alerts，这里每 10 秒拉一次。
+   App 切到后台时 JS 会被 iOS 冻住，回来再补拉，期间的提醒不会丢
+   （服务端存了最近 60 条）。
+   ========================================================= */
+let alertLast = Number(localStorage.getItem("shiyi_alert_last") || 0);
+let alertBooted = false;
+let alertTimer = null;
+
+function showAlert(it) {
+  const hot = (Number(it.level) || 1) >= 3;
+  clearEmpty();
+
+  const box = document.createElement("div");
+  box.className = "msg alert" + (hot ? " hot" : "");
+
+  const b = document.createElement("div");
+  b.className = "bubble";
+
+  const head = document.createElement("div");
+  head.className = "head";
+  const ttl = document.createElement("div");
+  ttl.className = "ttl";
+  ttl.textContent = "⚠ " + (it.title || "提醒");
+  const tm = document.createElement("div");
+  tm.className = "tm";
+  tm.textContent = String(it.ts || "").slice(5, 16);
+  head.appendChild(ttl);
+  head.appendChild(tm);
+
+  const bd = document.createElement("div");
+  bd.className = "bd";
+  bd.textContent = it.body || "";
+
+  b.appendChild(head);
+  b.appendChild(bd);
+  box.appendChild(b);
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const ask = document.createElement("button");
+  ask.className = "speak";
+  ask.textContent = "问拾壹";
+  ask.onclick = function () {
+    input.value = "刚才这条提醒我看到了，现在该怎么办？";
+    send();
+  };
+  meta.appendChild(ask);
+  box.appendChild(meta);
+
+  log.appendChild(box);
+  scrollDown();
+
+  call("buzz", { style: hot ? "heavy" : "medium" }).catch(function () {});
+  toast(it.title || "有新提醒");
+  // 只有"极度紧张"才自动念出来，否则太吵
+  if (hot) call("tts", { text: String(it.title || "") }).catch(function () {});
+}
+
+async function pollAlerts() {
+  if (document.hidden) return;
+  let d;
+  try {
+    d = await call("alerts", { since: alertLast });
+  } catch (e) {
+    return;                     // 电脑没开/换网了，安静等下一轮
+  }
+  const p = (d && d.payload) || d || {};
+  const items = p.items || [];
+  const last = Number(p.last) || 0;
+
+  // 服务端被清过（last 比本地指针小）→ 指针归零重来
+  if (last && last < alertLast) alertLast = 0;
+
+  // 第一次跑且从没接过：对着历史位置定个起点，别把旧提醒全弹出来
+  if (!alertBooted) {
+    alertBooted = true;
+    if (!alertLast) {
+      alertLast = last;
+      localStorage.setItem("shiyi_alert_last", alertLast);
+      return;
+    }
+  }
+
+  for (let i = 0; i < items.length; i++) showAlert(items[i]);
+  if (last > alertLast) {
+    alertLast = last;
+    localStorage.setItem("shiyi_alert_last", alertLast);
+  }
+}
+
+function startAlertPolling() {
+  if (alertTimer) clearInterval(alertTimer);
+  alertTimer = setInterval(pollAlerts, 10000);
+  setTimeout(pollAlerts, 1500);
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) pollAlerts();   // 回到前台立刻补一次
+  });
 }
 
 function setMode(m) {
@@ -614,6 +737,7 @@ window.__shiyiTtsDone = function () {
    ========================================================= */
 (async function boot() {
   setMode("shiyi");
+  startAlertPolling();          // 盯盘提醒：跟连接状态无关，独立轮询
   if (!NATIVE && !voiceSupported()) {
     setStatus("网页调试模式 · " + API, "warn");
     return;
