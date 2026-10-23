@@ -281,6 +281,11 @@ async function httpCall(method, p) {
     const r = await apiFetch("/health", { cache: "no-store" });
     return await r.json();
   }
+  if (method === "history") {
+    // 服务端落盘的共享历史：桌面端和手机端启动时都从这里回放
+    const r = await apiFetch("/history?limit=60", { cache: "no-store" });
+    return await r.json();
+  }
   if (method === "reset") {
     const r = await apiFetch("/api/reset", { method: "POST" });
     return await r.json();
@@ -339,6 +344,9 @@ const toastEl = $("toast"), whoTitle = $("whoTitle"), whoSub = $("whoSub"), avat
 
 let mode = "shiyi";
 let busy = false;
+let pendingText = "";        // 本端刚发出的文字：轮询拿回来时据此去重
+let lastHistId = 0;          // 已同步到的最大消息 id
+const renderedIds = new Set();
 let sessionId = localStorage.getItem("shiyi_session");
 if (!sessionId) {
   sessionId = "s" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -397,6 +405,45 @@ function addMsg(role, text, withSpeak) {
   scrollDown();
   return { box: box, bubble: bubble };
 }
+
+/* ---------- 历史同步：桌面端与手机端共用一份 ---------- */
+function remember(id) {
+  const n = Number(id || 0);
+  if (n > 0) {
+    renderedIds.add(n);
+    if (n > lastHistId) lastHistId = n;
+  }
+}
+
+function renderHist(m) {
+  const id = Number(m.id || 0);
+  if (id && renderedIds.has(id)) return;
+  if (id && m.role === "user" && pendingText && m.text === pendingText) {
+    // 就是本端刚发的那条，气泡已经在屏幕上了，只记 id 不重复渲染
+    remember(id);
+    return;
+  }
+  addMsg(m.role === "user" ? "user" : "bot", m.text, true);
+  remember(id);
+}
+
+async function loadHistory(initial) {
+  try {
+    const r = await apiFetch(initial ? "/history?limit=60" : ("/history?since=" + lastHistId),
+                             { cache: "no-store" });
+    const d = await r.json();
+    const items = (d && d.items) || [];
+    for (const m of items) renderHist(m);
+    if (d && d.last) lastHistId = Math.max(lastHistId, Number(d.last) || 0);
+    return items.length;
+  } catch (e) { return 0; }
+}
+
+// 每 3 秒拉一次增量：两端同时开着，一边说话另一边能看到
+setInterval(function () {
+  if (busy || document.hidden) return;
+  loadHistory(false);
+}, 3000);
 
 let speakingBtn = null;
 async function toggleSpeak(btn, text) {
@@ -500,8 +547,13 @@ async function pollAlerts() {
   const items = p.items || [];
   const last = Number(p.last) || 0;
 
-  // 服务端被清过（last 比本地指针小）→ 指针归零重来
-  if (last && last < alertLast) alertLast = 0;
+  // 服务端被清过 / id 换过编号（last 比本地指针小）→ 直接对齐服务端，
+  // 不要归零：归零会把整段历史一次性弹出来，糊满一屏
+  if (last && last < alertLast) {
+    alertLast = last;
+    localStorage.setItem("shiyi_alert_last", alertLast);
+    return;
+  }
 
   // 第一次跑且从没接过：不补弹历史（最多 30 条会刷屏），
   // 但把半小时内最新那条亮出来 —— 相当于"通道已就绪"的回执
@@ -561,6 +613,7 @@ async function send() {
   input.value = "";
   autoGrow();
   addMsg("user", text, false);
+  pendingText = text;
   busy = true;
   btnSend.disabled = true;
   setStatus("正在思考…", "warn");
@@ -569,10 +622,13 @@ async function send() {
   const t0 = Date.now();
 
   try {
-    const data = await call("chat", { text: text, session: sessionId, to: mode });
+    const data = await call("chat", { text: text, session: sessionId, to: mode,
+                                      src: NATIVE ? "mobile" : "desktop" });
     const reply = (data && data.reply) || "（空回答）";
     slot.bubble.textContent = reply;
     slot.box.className = "msg bot";
+    // 这两条服务端已入库，记下 id 免得轮询重复渲染
+    if (data) { remember(data.id_user); remember(data.id_bot); }
     // 补上朗读按钮
     const meta = document.createElement("div");
     meta.className = "meta";
@@ -590,6 +646,7 @@ async function send() {
     setStatus("连接异常", "err");
   } finally {
     busy = false;
+    pendingText = "";
     btnSend.disabled = false;
     scrollDown();
   }
@@ -766,7 +823,12 @@ window.__shiyiTtsDone = function () {
   try {
     const t0 = Date.now();
     await call("health", {});
-    setStatus("电脑在线 · " + ((Date.now() - t0) / 1000).toFixed(1) + "s · 可以说话", "ok");
+    // 回放共享历史（桌面/手机同一份）：让打开的界面接着上次聊
+    try {
+      const n = await loadHistory(true);
+      if (n) setStatus("已同步上次对话 · " + n + " 条 · 电脑在线", "ok");
+    } catch (e2) {}
+    if (!log.querySelector(".msg")) setStatus("电脑在线 · " + ((Date.now() - t0) / 1000).toFixed(1) + "s · 可以说话", "ok");
   } catch (e) {
     setStatus("连不上电脑 · 检查 8899 服务或网络", "err");
   }
