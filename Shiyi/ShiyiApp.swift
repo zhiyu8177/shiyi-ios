@@ -484,11 +484,18 @@ struct WebView: UIViewRepresentable {
 
         bridge.webView = webView
 
-        // 界面打包在 App 内（真 APP 版），启动即用，不联网拉页面
-        if let local = Bundle.main.url(forResource: "index", withExtension: "html") {
+        // 界面优先从电脑上的服务端拉（2026-10-23）：
+        // 以前 index.html 打进包里，改一行界面就得重新打包安装，手机端永远落后一个包
+        // （历史回放、alerts 轮询都因此拿不到）。现在加载 http://<电脑>:8899/ 的
+        // 服务端页面，界面永远是最新的；连不上（电脑关机、不在同一网络）才退回包内页面。
+        webView.navigationDelegate = context.coordinator
+        if let url = URL(string: SERVER + "/") {
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 8
+            req.cachePolicy = .reloadIgnoringLocalCacheData
+            webView.load(req)
+        } else if let local = Bundle.main.url(forResource: "index", withExtension: "html") {
             webView.loadFileURL(local, allowingReadAccessTo: local.deletingLastPathComponent())
-        } else {
-            webView.load(URLRequest(url: URL(string: SERVER)!))
         }
 
         // 长按不弹菜单，操作更像原生 App
@@ -499,6 +506,23 @@ struct WebView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    /// 服务端页面打不开（电脑没开机 / 不在同一网络）时，退回包内页面兜底。
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        private var didFallback = false
+
+        func webView(_ webView: WKWebView,
+                     didFailProvisionalNavigation navigation: WKNavigation!,
+                     withError error: Error) {
+            guard !didFallback else { return }
+            didFallback = true
+            if let local = Bundle.main.url(forResource: "index", withExtension: "html") {
+                webView.loadFileURL(local, allowingReadAccessTo: local.deletingLastPathComponent())
+            }
+        }
+    }
 }
 
 // ---------------- 入口 ----------------
