@@ -222,6 +222,11 @@ let API = (location.protocol === "http:" || location.protocol === "https:")
 const H = window.webkit && window.webkit.messageHandlers;
 const NATIVE = !!(H && H.api);
 
+/* 页面版本号：改页面就改这里。
+   启动时打一条 /__page 到电脑端日志，"手机上跑的是哪版页面 / 是 App 还是浏览器 /
+   实际连的哪个地址" 一眼可查，不用再靠猜。 */
+const BUILD = "20261023-1155";
+
 let _seq = 0;
 const _pending = new Map();
 
@@ -283,7 +288,11 @@ async function httpCall(method, p) {
   }
   if (method === "history") {
     // 服务端落盘的共享历史：桌面端和手机端启动时都从这里回放
-    const r = await apiFetch("/history?limit=60", { cache: "no-store" });
+    // p.since > 0 只取新增（增量轮询），否则取最近 limit 条
+    const since = Number(p.since || 0);
+    const limit = Number(p.limit || 60);
+    const qs = since > 0 ? ("?since=" + since + "&limit=" + limit) : ("?limit=" + limit);
+    const r = await apiFetch("/history" + qs, { cache: "no-store" });
     return await r.json();
   }
   if (method === "reset") {
@@ -427,14 +436,28 @@ function renderHist(m) {
   remember(id);
 }
 
+/* 把服务端给的最大 id 记下来；就算服务端没带 last，也从 items 里自己推一遍。
+   2026-10-23：手机上出现 lastHistId 死锁在 0（每 3 秒重拉全量、还一条都不显示），
+   根因是包内 file:// 页面直接 fetch 被 WKWebView 跨源挡掉。
+   现在改成走 call()：App 里走原生桥，浏览器里走 fetch，两边都不受跨源限制。 */
+function appliedLast(d) {
+  const last = Number((d && d.last) || 0);
+  if (last > lastHistId) lastHistId = last;
+  const items = (d && d.items) || [];
+  for (const m of items) {
+    const n = Number(m.id || 0);
+    if (n > lastHistId) lastHistId = n;
+  }
+}
+
 async function loadHistory(initial) {
   try {
-    const r = await apiFetch(initial ? "/history?limit=60" : ("/history?since=" + lastHistId),
-                             { cache: "no-store" });
-    const d = await r.json();
+    const d = initial
+      ? await call("history", { limit: 60 })
+      : await call("history", { since: lastHistId, limit: 200 });
     const items = (d && d.items) || [];
     for (const m of items) renderHist(m);
-    if (d && d.last) lastHistId = Math.max(lastHistId, Number(d.last) || 0);
+    appliedLast(d);
     return items.length;
   } catch (e) { return 0; }
 }
@@ -814,6 +837,9 @@ window.__shiyiTtsDone = function () {
    ========================================================= */
 (async function boot() {
   setMode("shiyi");
+  // 信标：先报到，再干活。这样即使后面某步炸了，电脑端日志也能看到手机跑的是哪版页面。
+  apiFetch("/__page?v=" + BUILD + "&native=" + (NATIVE ? 1 : 0) +
+           "&api=" + encodeURIComponent(API), { cache: "no-store" }).catch(function () {});
   startAlertPolling();          // 盯盘提醒：跟连接状态无关，独立轮询
   if (!NATIVE && !voiceSupported()) {
     setStatus("网页调试模式 · " + API, "warn");
