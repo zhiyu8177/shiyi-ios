@@ -94,6 +94,11 @@ final class NativeBridge: NSObject, WKScriptMessageHandler,
             health(id)
         case "reset":
             reset(id)
+        case "history":
+            // 共享历史：桌面端和手机端同一份，?since=<id> 只取新增
+            history(id,
+                    since: (params["since"] as? NSNumber)?.intValue ?? 0,
+                    limit: (params["limit"] as? NSNumber)?.intValue ?? 60)
         case "chat":
             chat(id, params)
         case "tts":
@@ -249,6 +254,21 @@ final class NativeBridge: NSObject, WKScriptMessageHandler,
             if let err = err { self.reject(id, "清空失败：\(err)"); return }
             if code >= 400 { self.reject(id, "清空失败（HTTP \(code)）"); return }
             self.resolve(id, ["ok": true])
+        }
+    }
+
+    // ========== 共享历史 ==========
+    /// 读服务端落盘的共享历史。走原生 GET（CFNetwork），
+    /// 这样即使界面是从包里 file:// 加载的，也不会被 WKWebView 的跨源策略挡掉。
+    private func history(_ id: Int, since: Int, limit: Int) {
+        let qs = since > 0 ? "?since=\(since)&limit=\(limit)" : "?limit=\(limit)"
+        fetchJSON("/history" + qs) { [weak self] obj, code in
+            guard let self = self else { return }
+            guard let obj = obj else {
+                self.reject(id, "历史读取失败（HTTP \(code)）")
+                return
+            }
+            self.resolve(id, obj)
         }
     }
 
@@ -485,18 +505,13 @@ struct WebView: UIViewRepresentable {
         bridge.webView = webView
 
         // 界面优先从电脑上的服务端拉（2026-10-23）：
-        // 以前 index.html 打进包里，改一行界面就得重新打包安装，手机端永远落后一个包
-        // （历史回放、alerts 轮询都因此拿不到）。现在加载 http://<电脑>:8899/ 的
-        // 服务端页面，界面永远是最新的；连不上（电脑关机、不在同一网络）才退回包内页面。
+        // 以前 index.html 打进包里，改一行界面就得重新打包安装，手机端永远落后一个包。
+        // 但旧写法是直接拿 SERVER（候选第 0 个 = 已停用的联想机地址）去 load，
+        // 地址一死必然超时、退回包内 file:// 页面，而 file:// 页面 fetch 服务端会被
+        // WKWebView 跨源拦掉 —— 表现就是"界面能开、历史一条不显示、发消息也没回显"。
+        // 现在：先并发探测候选地址，先通先加载；全都不通才退回包内页面（走原生桥，功能仍是全的）。
         webView.navigationDelegate = context.coordinator
-        if let url = URL(string: SERVER + "/") {
-            var req = URLRequest(url: url)
-            req.timeoutInterval = 8
-            req.cachePolicy = .reloadIgnoringLocalCacheData
-            webView.load(req)
-        } else if let local = Bundle.main.url(forResource: "index", withExtension: "html") {
-            webView.loadFileURL(local, allowingReadAccessTo: local.deletingLastPathComponent())
-        }
+        context.coordinator.begin(webView)
 
         // 长按不弹菜单，操作更像原生 App
         let css = "addEventListener('DOMContentLoaded',function(){var s=document.createElement('style');" +
@@ -509,18 +524,60 @@ struct WebView: UIViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    /// 服务端页面打不开（电脑没开机 / 不在同一网络）时，退回包内页面兜底。
+    /// 先探测地址再决定加载哪份界面。
     final class Coordinator: NSObject, WKNavigationDelegate {
-        private var didFallback = false
+        private weak var view: WKWebView?
+        private var decided = false
+        private var isRemote = false
+
+        func begin(_ webView: WKWebView) {
+            view = webView
+            let group = DispatchGroup()
+            for base in SERVER_CANDIDATES {
+                group.enter()
+                probeHealth(base, timeout: 4) { ok in
+                    if ok { self.pick(base) }
+                    group.leave()
+                }
+            }
+            // 全部候选都不通（电脑关机 / 不在同一网络）→ 退回包内页面
+            group.notify(queue: .main) {
+                if !self.decided {
+                    self.decided = true
+                    self.loadLocal()
+                }
+            }
+        }
+
+        private func pick(_ base: String) {
+            guard !decided else { return }
+            decided = true
+            isRemote = true
+            SERVER = base                      // 原生桥的接口也统一用这个地址
+            guard let url = URL(string: base + "/") else { loadLocal(); return }
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 10
+            req.cachePolicy = .reloadIgnoringLocalCacheData
+            view?.load(req)
+        }
+
+        private func loadLocal() {
+            isRemote = false
+            if let local = Bundle.main.url(forResource: "index", withExtension: "html") {
+                view?.loadFileURL(local, allowingReadAccessTo: local.deletingLastPathComponent())
+            }
+        }
 
         func webView(_ webView: WKWebView,
                      didFailProvisionalNavigation navigation: WKNavigation!,
                      withError error: Error) {
-            guard !didFallback else { return }
-            didFallback = true
-            if let local = Bundle.main.url(forResource: "index", withExtension: "html") {
-                webView.loadFileURL(local, allowingReadAccessTo: local.deletingLastPathComponent())
-            }
+            if isRemote { loadLocal() }
+        }
+
+        func webView(_ webView: WKWebView,
+                     didFail navigation: WKNavigation!,
+                     withError error: Error) {
+            if isRemote { loadLocal() }
         }
     }
 }
