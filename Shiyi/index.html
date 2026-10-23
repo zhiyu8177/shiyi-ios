@@ -225,7 +225,7 @@ const NATIVE = !!(H && H.api);
 /* 页面版本号：改页面就改这里。
    启动时打一条 /__page 到电脑端日志，"手机上跑的是哪版页面 / 是 App 还是浏览器 /
    实际连的哪个地址" 一眼可查，不用再靠猜。 */
-const BUILD = "20261023-1155";
+const BUILD = "20261023-1100";
 
 let _seq = 0;
 const _pending = new Map();
@@ -463,10 +463,20 @@ async function loadHistory(initial) {
 }
 
 // 每 3 秒拉一次增量：两端同时开着，一边说话另一边能看到
+// 2026-10-23：原来这里挡了 document.hidden（窗口最小化/被遮住就停轮询），
+// 电脑端窗口一被压到后面就"没反应"了。改成照拉，代价可以忽略。
 setInterval(function () {
-  if (busy || document.hidden) return;
+  if (busy) return;
   loadHistory(false);
 }, 3000);
+
+// 窗口重新回到前台立刻补一次，不用等下一个 3 秒
+document.addEventListener("visibilitychange", function () {
+  if (!document.hidden && !busy) loadHistory(false);
+});
+window.addEventListener("focus", function () {
+  if (!busy) loadHistory(false);
+});
 
 let speakingBtn = null;
 async function toggleSpeak(btn, text) {
